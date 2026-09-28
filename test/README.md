@@ -1,7 +1,7 @@
 # pi-thinking-router-jev 测试设计
 
 > 本目录文档说明路由器的验证体系：三层测试如何设计、各自覆盖什么、如何运行。
-> 实验结果与图表见根 [README](../README.md) §6。
+> 实验结果与图表见根目录的[验证文档](../docs/validation.md)。
 
 ## 总览
 

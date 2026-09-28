@@ -1,335 +1,116 @@
-# pi-thinking-router-jev — 基于 Jev 的自适应 Thinking Level Router
+# pi-thinking-router-jev
 
-> 一个 [pi coding agent](https://pi.dev) 扩展：根据当前任务状态与执行反馈，动态选择模型的 Thinking Level（`low / medium / high / xhigh`），在保证任务成功率的前提下尽量用更低的推理档位，降低成本与延迟。
->
-> **它不切换模型，不写代码，不碰 Agent Loop** —— 只做一件事：读状态 → 问 Jev（或本地规则兜底）→ `pi.setThinkingLevel()`。
+> 面向 [pi](https://pi.dev) 的自适应 Thinking Level 路由器：根据任务状态和执行反馈，在 `low / medium / high / xhigh` 之间动态选择合适档位。
 
-[![ci](https://github.com/Wh0rigin/pi-jev-router/actions/workflows/ci.yml/badge.svg)](https://github.com/Wh0rigin/pi-jev-router/actions/workflows/ci.yml) [![tests](https://img.shields.io/badge/tests-45%20pass%20%2B%201%20live-brightgreen)](test/README.md) [![pi](https://img.shields.io/badge/pi-0.86.1-blue)]() [![jev](https://img.shields.io/badge/jev--1.13.0-live%20verified-orange)]()
+[![CI](https://github.com/Wh0rigin/pi-jev-router/actions/workflows/ci.yml/badge.svg)](https://github.com/Wh0rigin/pi-jev-router/actions/workflows/ci.yml) [![Tests](https://img.shields.io/badge/tests-45%20pass%20%2B%201%20live-brightgreen)](test/README.md) [![pi](https://img.shields.io/badge/pi-0.86.1-blue)](https://pi.dev)
 
----
+它只负责一件事：读取 Agent 状态 → 咨询 Jev 或本地规则 → 调用 `pi.setThinkingLevel()`。它不会切换模型、修改代码或接管 Agent Loop。
 
-## 1 它解决什么问题
+## 功能
 
-| 任务 | 合理档位 | 固定档位的代价 |
-|---|---|---|
-| 改个变量名 / 简单配置 | **low** | 固定 high → 白白烧推理 token |
-| 普通功能开发 / 一般 bug 修复 | **medium** | 固定 low → 复杂任务成功率下降 |
-| 复杂 debug / 并发 / 多文件重构 | **high** | |
-| 大型架构设计 / 多次失败后的深水区 | **xhigh** | |
+- 任务开始时选择初始档位；推理型失败时按需升级；连续稳定时尝试降级。
+- 使用 Jev 的离散选择结果，并在 Jev 未配置或调用失败时自动切换到本地规则。
+- 内置防抖、升级/降级上限、任务基线、冷却窗口和手动接管，避免档位频繁跳动。
+- 通过 JSONL 记录每次决策，便于排查和统计。
 
-档位不应该在任务开始时定死：**第一次尝试失败了，问题可能变难；连续顺利，可能又变简单**。pi-thinking-router-jev 把这个判断交给 Jev（一个高效的离散选择概率模型），把"持续重估"挂进 pi 的事件回路。
-
-## 2 系统结构
+## 工作方式
 
 ```mermaid
-flowchart TB
-    USER["用户任务"] --> BAS["before_agent_start<br/>任务起点"]
-    subgraph PI["pi coding agent"]
-        LOOP["agent loop<br/>(模型 + 工具循环)"]
-        subgraph EXT["thinking-router 扩展"]
-            STATE["AgentState<br/>tool_calls · failures · tests<br/>changed_files · recent_error"]
-            TRIG["触发器<br/>task-start / failure /<br/>downgrade-check"]
-            POL["policy 防抖钳制<br/>+1/-1 步 · 上限 · 冷却<br/>手动覆盖 · 稳定窗口"]
-            LOG["JSONL 决策日志"]
-        end
-    end
-    subgraph JEVC["jev-client"]
-        KEY["key 解析: config → JEV_API_KEY<br/>→ cc-switch 凭据库"]
-    end
-    JEV[["jev-1.13.0（choice 协议）<br/>输入: 任务状态快照<br/>输出: low/medium/high/xhigh + 概率"]]
-    RULES[["本地规则引擎<br/>(未配置/失败时兜底)"]]
-
-    BAS --> STATE --> TRIG
-    LOOP -- "turn_end(toolResults)" --> STATE
-    TRIG --> KEY --> JEV
-    JEV -- "level + probabilities" --> POL
-    RULES -.->|"fallback"| POL
-    POL -->|"setThinkingLevel"| LOOP
-    POL --> LOG
+flowchart LR
+    A[任务与执行反馈] --> B[AgentState]
+    B --> C{Jev 可用?}
+    C -->|是| D[Jev choice]
+    C -->|否/失败| E[本地规则]
+    D --> F[防抖与边界检查]
+    E --> F
+    F --> G[pi.setThinkingLevel]
 ```
 
-- **实线** = 决策路径；**虚线** = 兜底路径。
-- 扩展只监听 pi 事件（`before_agent_start` / `turn_end` / `thinking_level_select` / `agent_settled`），唯一的写操作是 `pi.setThinkingLevel()`。`turn_end` 处理器在下一轮 LLM 调用前被 await（已核实 pi 源码 `agent-session.js`），因此调级精确作用于同一次 agent run 的下一次请求。
+路由只在以下时机评估：
 
-## 3 决策时机（避免过度调用）
+| 时机 | 行为 |
+|---|---|
+| `task-start` | 为新任务选择初始档位；steer/follow-up 不重复初始化 |
+| `failure` | 仅推理型失败触发升级评估；网络、Docker、限流等环境问题不会升级 |
+| `downgrade-check` | 连续稳定达到阈值后评估降级 |
+| 手动改档 | 进入 `manual-override`，静默到下一任务 |
 
-| 时机 | 触发条件 | 行为 |
-|---|---|---|
-| **task-start** | 新任务（steer/follow-up 不算） | 问 Jev 初始档位（未配置 → 规则引擎按任务类型定基线） |
-| **failure** | 出现**推理型**失败（测试失败/编译错误/断言/异常） | 问 Jev 是否升级；**新鲜失败绕过冷却窗口** |
-| **downgrade-check** | 连续 `downgradeStableTurns` 轮无失败 | 问 Jev 是否降级（有稳定性窗口 + 基线地板） |
-| ~~每个 tool call~~ | ✗ | 从不 |
-| ~~每个 token~~ | ✗ | 从不 |
+默认保护策略：单次最多调整一档；每个任务最多升/降各 2 次；降级需要稳定窗口；新鲜推理失败可以绕过 Jev 冷却窗口。
 
-**环境型失败（网络断连、Docker 未启动、磁盘满、限流 429…）永不触发升级**——更多推理解决不了网络故障（spec §8）。本地分类器先过滤，只有推理型失败才进入升级评估，且不会调用 Jev。
+## 安装
 
-## 4 防抖（anti-flap）
+将仓库注册到 pi 的 `~/.pi/agent/settings.json`：
 
-- **每次决策最多 ±1 步**（task-start 的初始选择除外）；
-- 每任务升级上限 `maxEscalationsPerTask: 2`、降级上限 `maxDowngradesPerTask: 2`；
-- 降级需要 `downgradeStableTurns: 2` 连续干净轮次，且默认不低于任务基线（长期稳定 ×2 才允许击穿到更低）；
-- 调级后 `pinTurns: 1` 轮内锁定；
-- Jev 调用间隔 `minCallIntervalMs: 15000`，但**新失败旁路冷却**（回归测试覆盖）；
-- 用户手动改档（`/thinking`、Shift+Tab）→ **manual-override**：路由器沉默到下一任务。
+```json
+{
+  "extensions": ["C:/path/to/pi-thinking-router-jev"]
+}
+```
 
-## 5 安装与配置
+或仅在当前会话临时加载：
 
 ```bash
-# 方式一：注册到 pi settings（推荐，跟随 git 仓库更新）
-#   ~/.pi/agent/settings.json:
-#   "extensions": ["C:/Users/Administrator/Documents/pi-thinking-router-jev"]
-
-# 方式二：临时加载
 pi -e ./index.ts
 ```
 
-配置文件 `~/.pi/thinking-router.json`（也可用 `/thinking-router set <key> <value>`）：
+## 配置
+
+配置文件为 `~/.pi/thinking-router.json`，也可以使用 `/thinking-router set <key> <value>` 修改：
 
 ```json
 {
   "enabled": true,
-  "endpoint": "<jev 端点>",
+  "endpoint": "<jev endpoint>",
   "model": "jev-latest",
-  "providerId": "<cc-switch 凭据库中的 provider id>",
-  "timeoutMs": 20000,
-  "minCallIntervalMs": 15000,
-  "maxEscalationsPerTask": 2,
-  "maxDowngradesPerTask": 2,
-  "downgradeStableTurns": 2,
-  "pinTurns": 1,
+  "providerId": "<cc-switch provider id>",
   "logEnabled": true,
   "logFile": "~/.pi/thinking-router/decisions.jsonl"
 }
 ```
 
-API key 解析顺序：`config.apiKey` → `JEV_API_KEY` 环境变量 → cc-switch 凭据库（与 [pi-decision-prior] 相同的解析链）。
-**未配置 endpoint/model 时：会话开始弹一次警告，之后由本地规则引擎接管路由**——任务类型决定基线（documentation→low，implementation/debugging/refactoring/testing→medium，architecture/optimization→high），失败照常升级，一切照常工作。
+API key 的读取顺序为：`config.apiKey` → `JEV_API_KEY` → cc-switch 凭据库。
 
-### 命令
+未配置 `endpoint` 或 `model` 时，路由器会提示一次，然后使用本地规则继续工作：文档任务默认 `low`，实现/调试/测试默认 `medium`，架构/优化默认 `high`。
 
-```
-/thinking-router            # 开关自动路由（写入配置，重启会话保留）
-/thinking-router status     # 当前状态：档位来源 / 计数 / 日志路径
-/thinking-router test       # 连通性测试（真实问一次 Jev）
-/thinking-router set k v    # 改配置
-/thinking-router log        # 最近 5 条决策
-```
+## 命令
 
-状态栏徽标：`jev:medium`（Jev 主导）/ `jev:medium(rules)`（本地规则）/ `jev:medium(fallback)`（Jev 失败兜底）/ `jev:medium(manual)`（用户接管）。
-
-### 日志（实验用，spec §12）
-
-JSONL，两种条目。`reason` 一律由本地钳制层生成；Jev 本身只回答档位。
-
-```json
-{"kind":"decision","timestamp":"...","task_id":"b752ab7a","trigger":"task-start",
- "source":"jev","task_type":"implementation","thinking_level_before":"high",
- "thinking_level_after":"low","changed":true,"clamped":false,
- "reason":"initial level for implementation task via jev (confidence 0.98)",
- "previous_failures":0,"tool_calls":0,"tests_run":0,"tests_failed":0,
- "context_tokens":0,"jev_latency_ms":978,"jev_confidence":0.98,
- "jev_probabilities":{"low":0.98,...},
- "jev_input_tokens":832,"jev_output_tokens":42,
- "execution_time_ms":979}
+```text
+/thinking-router            # 开关自动路由
+/thinking-router status     # 查看当前档位、来源、计数和日志路径
+/thinking-router test       # 真实调用一次 Jev 测试连通性
+/thinking-router set k v    # 修改配置
+/thinking-router log        # 查看最近 5 条决策
 ```
 
-`jev_input_tokens/jev_output_tokens` 是 jev 模型自身的消耗（协议响应自带 usage），与主模型的 token **分开计价、分开统计，永不混合**。
-```
+状态栏示例：`jev:medium`、`jev:medium(rules)`、`jev:medium(fallback)`、`jev:medium(manual)`。
 
----
-
-## 6 验证
-
-三层验证：**单元/集成测试（全离线）→ 真实 Jev 连通性 → 真实 pi 端到端**。测试设计的完整细节（各层覆盖什么、mock 服务器怎么设计、对抗样本清单、回归用例的来历）见 **[test/README.md](test/README.md)**。
-
-![测试结果](assets/test-results.png)
-
-### 6.1 单元 + 集成测试（45 项，全离线）
+## 验证
 
 ```bash
-npm test        # node --test test/
+npm test                                      # 单元 + 集成测试，完全离线
+JEV_LIVE=1 npm run test:live                  # 真实 Jev 连通性
+npm run ping                                  # Jev 双探针
+npm run benchmark                             # 3-seed A/B 实验
 ```
 
-覆盖：档位解析与折叠、错误分类（环境 vs 推理，含"裸 500 不得误判"等对抗样本）、状态计数、规则引擎、**全部钳制规则**（+1/-1 步、上限、地板、锁定、冷却、新鲜失败旁路）、配置校验。集成测试用 **mock Jev HTTP 服务器**走完整回路：task-start → 失败升级 → 干净降级 → 再失败 → 上限钳制 → 手动接管 → fallback（HTTP 500 / 畸形回答 / 未配置 / 非推理模型 / 关闭开关）→ JSONL 字段断言。
+- [测试设计与运行手册](test/README.md)：测试分层、mock Jev、错误分类、回归用例和实验方法。
+- [验证结果与图表](docs/validation.md)：真实 Jev、E2E、A/B 实验结果及复现说明。
 
-关键回归用例（由真实 E2E 发现的 bug 驱动，见 §6.4）：
+## 仓库结构
 
-```
-✔ fresh failure bypasses the cooldown left by the task-start call
-✔ downgrade right after an escalation is pinned
-✔ environment-only failures never escalate nor call jev
-✔ jev HTTP failure -> falls back to local rules, keeps routing alive
-✔ malformed jev answer -> fallback, invalid level never applied
-✔ hung jev endpoint -> timeout fires, falls back to rules, loop completes
-```
-
-### 6.2 脚本化全回路（集成测试场景）
-
-![mock loop](assets/mock-loop.png)
-
-mock Jev 按脚本应答，验证档位曲线完全符合设计：low →(jev)→ medium →(测试失败)→ high →(2 轮干净)→ medium →(再失败)→ high →(再失败)→ **上限钳制保持 high**。
-
-### 6.3 真实 Jev 连通性与判别力
-
-```bash
-JEV_LIVE=1 JEV_ENDPOINT=... JEV_MODEL=jev-latest node --test test/live-jev.test.ts
-JEV_ENDPOINT=... JEV_MODEL=jev-latest node scripts/jev-ping.ts
+```text
+src/                 核心状态、策略、Jev 客户端、配置和日志
+index.ts             pi 扩展入口与 /thinking-router 命令
+test/                单元、集成和 live 测试
+scripts/             Jev 探针、A/B 基准和图表脚本
+assets/              验证结果图表
+docs/validation.md   详细验证结果
 ```
 
-真实 jev-1.13.0 的响应分布（全部为真实调用记录，含重放快照；jev 非确定性，同快照两次调用分布不同）：
+## 限制与后续计划
 
-![jev distributions](assets/jev-distributions.png)
+当前实现用关键词近似任务类型，用相关路径近似相关文件；pi 的通知型事件也无法阻止用户手动改档。Jev 是概率模型，因此最终档位由本地防抖层约束。
 
-- 琐碎重命名 → **low** (p=0.98)；文档改动 → **low** (0.81)
-- 调试任务起点 → **medium** (0.98)；测试失败但 bug 是一行修复 → **保持 medium** (0.61, low=0.25 —— 它真的会考虑"不升级")
-- 并发 NPE 排查 → **high** (0.99/0.97)
-- 全新缓存架构设计 → **xhigh** (0.78) —— 只有真正的架构级任务才给出 xhigh，符合"最后一级"定位
+后续可扩展历史任务统计、成本/延迟报表、决策缓存，以及独立的 `pi-model-router-jev` 模型路由项目。
 
-延迟（全部 ≪ 20s 超时守卫）：
-
-![jev latency](assets/jev-latency.png)
-
-### 6.4 真实 pi 端到端（glm-5.3-flash + jev-1.13.0）
-
-```bash
-pi -e ./index.ts --no-session -p "<任务>"
-```
-
-三个真实任务（决策日志 `~/.pi/thinking-router/decisions.jsonl`）：
-
-| 任务 | task-start 决策 | 后续触发 | 结果 |
-|---|---|---|---|
-| `app.js` 重命名变量（琐碎） | **high → low**（jev p(low)=0.98, 978ms） | — | 1 次工具调用完成，全程 low ✅ |
-| "先跑测试再修复"（calc.js 整数除法 bug，第 1 次运行） | high → medium（jev conf 0.65） | （模型先修后测，未产生失败） | ✅ |
-| 同任务第 2 次（强制先跑失败测试） | high → medium（conf 0.56, 1712ms） | **failure 触发 → Jev 428ms 应答 → 主动保持 medium**（一行 bug 不值得升档）；downgrade-check → 保持 | 测试 1/2 失败后恢复，最终 medium 修完 ✅ |
-
-![E2E routing](assets/e2e-routing.png)
-
-左：E2E 调试任务的三个决策点（每个触发都真实咨询了 Jev）；右：各决策的 Jev 延迟。
-
-**§6.4 的副产品：一个真实 bug。** 第一次 E2E 调试运行中，turn 0 的测试失败被 task-start 调用留下的 15s 冷却窗口**静默吞掉**（18.5s 的短任务整个落在窗口内）。修复方式是"新鲜失败旁路"：只要存在上次 Jev 调用未见过的推理失败，失败触发就绕过冷却。该回归场景已固化进集成测试（§6.1 第一条 ✔）。第二次 E2E 运行确认修复生效。
-
-### 6.5 3-seed A/B：固定 thinking=max（不切换）vs thinking-router
-
-用 `scripts/benchmark.ts` 跑了真实 A/B 对比：同一“先跑失败测试、再修复”任务，A 臂**不加载扩展、档位恒为 max**（`pi --mode json --thinking max`），B 臂加载 thinking-router 自动选档；每臂 3 次独立重复，A/B 交替执行以解耦时间漂移，每次运行使用全新临时目录。
-
-**计费口径说明**：主模型（glm）与 jev 是两个不同价格的模型，token **分开统计、分开呈现，永不混合**。glm token 来自 pi 的 `message_end.usage` 事件；jev token 来自决策日志的 `jev_input_tokens/jev_output_tokens` 字段（jev 协议响应自带的 usage）。换算成钱请分别套用各自单价。
-
-![3-seed A/B](assets/ab-3seed.png)
-
-| 指标（mean ± stdev，n=3） | max | thinking-router | Δ |
-|---|---|---|---|
-| wall 时间 | 23.2 ± 5.2 s | 22.7 ± 1.0 s | −2%（持平；路由臂方差更小） |
-| **glm** input tokens（不含缓存） | 10590 ± 7398 | 9368 ± 5633 | −11.5%（方向性） |
-| **glm** output tokens | 253 ± 46 | 248 ± 43 | −2% |
-| **jev** tokens（独立计价，另算） | — | 2130 ± 1 in + 138 out ≈ **2.27k/任务** | 4 次决策 ≈ 567 tokens/次 |
-| 任务成功 | 3/3 | 3/3 | 持平 |
-
-**读数（如实）**：
-
-1. **成功率不打折**：6/6 运行全部修复成功，路由没有用低档位换失败率；
-2. **wall 持平且路由臂更稳**：两次独立 3-seed 实验（首次 max 20.8 vs jev 21.3，本次 23.2 vs 22.7）方向都持平；jev 的调用延迟（≈0.4–1.7s × 4）被更合适的档位抵消；
-3. **glm input 有下降趋势（−11.5%）但方差大**——n=3 只能看方向；两次独立实验方向一致（首次 −19%）；
-4. **jev 的开销高度稳定且可预估**：≈2.27k tokens/任务（2130 in + 138 out，4 次决策），跨 seed 几乎无波动——把它套上 jev 的单价，与 glm 侧节省的钱相减，才是净收益；两个价格不同，**不能拿 jev token 直接去抵 glm token**；
-5. 本表未含思考 token 的单独细分（glm 的 output 计费内）；
-6. 已知局限：LLM API 无真 seed，"3 seed" 指 3 次独立重复；glm-5.3-flash 的 `thinkingLevelMap` 仅 `max→max` 映射有效，其余档位不发思考参数，因此对比的本质是“每轮都带 max 思考 vs 大多数轮不带思考 + jev 开销”（见 [test/README.md](test/README.md) §4）。
-
-复现：`node scripts/benchmark.ts --seeds 3`，原始数据在 `tmp/benchmark-results.json`。
-
-### 6.6 结果小结
-
-1. **闭环成立**：任务起点、失败、降级三个触发点都真实到达 Jev，钳制层只在必要时修正；
-2. **Jev 有自己的"反升级"判断**：一行 bug 的测试失败它选择保持 medium（p=0.61），并非无脑升级——符合"能用低等级就不升"的核心目标；
-3. **失败安全可用**：HTTP 500 / 畸形回答 / 未配置 / 非推理模型 / 手动接管，全部回到安全路径且留痕；
-4. **成本观感**：Jev 单次调用 0.4–1.7s、数百 token，相对一次被避免的 high/xhigh 主模型推理是净赚；琐碎任务被压到 low 的收益在 E2E 中直接可观测。
-
-## 7 限制与边界（如实报告）
-
-- pi 不暴露"相关文件"概念，`relevant_files` 用 read/grep 与 edit/write 路径去重近似；
-- `task_type` 是本地关键词启发分类，最终解释权在 Jev（状态快照里带了原文）；
-- `thinking_level_select` 是通知型事件，无法阻止用户手动改档，只能检测并让位；
-- 非 TUI 模式（`-p`）下 `notify`/`setStatus` 是空操作，日志文件是主要观测面；
-- Jev 是概率模型且非确定性：同快照两次调用分布可能不同（§6.3 已观测），钳制层保证这不会造成档位抖动；
-- TUI 状态栏徽标在 print 模式不可见，需要在交互模式人工确认（本文档所有验证均在 `-p` 模式完成）。
-
-## 8 未来展望
-
-### 8.1 本仓库（pi-thinking-router-jev）第二阶段
-
-历史任务统计 → 按任务类型的最佳档位学习 → 成功率/Token 成本/延迟报表 → 失败原因分类细化 → Context-aware routing（把会话摘要纳入状态）→ Jev 决策缓存 → 自适应策略（从 JSONL 日志学习各触发点的最优钳制参数）。
-
-### 8.2 姊妹项目：pi-model-router-jev（立项构想）
-
-本仓库刻意只回答一个问题：**“档位多深”**。但同一个决策回路里还藏着一层更大的问题：**“谁来推理”** —— 大多数人事实上永远挂在最强模型 + 最高档位，而为失败升级、为简单任务降档的思路同样适用于模型与供应商的选择。
-
-**为什么这件事在 pi 上特别成立**：与 Codex 这类绑定单一供应商的产品不同，pi 本身就是一个可以接各供应商模型的集大成 harness——Anthropic / OpenAI / Google / DeepSeek / xAI / ZAI / OpenRouter 及任意自定义中转都能共存于同一个会话（`modelRegistry` + `scopedModels` + `pi.setModel()`，本仓库已在真实多供应商配置上验证过）。这意味着模型路由可以工作在**比“换模型”更高一层的“换供应商系”**：
-
-- 复杂 debug 失败 → 切到 **grok 系**（推理/工具调用强）；
-- 大上下文分析 → 切到 **glm 系**（长上下文 + 成本友好）；
-- 深度推理需求 → 切到 **DeepSeek/DS 系**；
-- 简单改动 → 任意便宜系。
-
-而“整体模型性能梯度”——即“更强/更便宜”这个升降水序的客观依据——可以参考 **[Artificial Analysis](https://artificialanalysis.ai)** 的独立评测结果（智能指数、推理/编码能力分、价格、延迟），把它作为策略引擎的性能梯度表：同一梯度上，失败升级沿梯度向上走，阶段降级沿梯度向下走，避免“更强”变成拍脑袋。
-
-规划为**独立的新项目**（而非本仓库的扩展），定位是模型无关的**策略引擎**：
-
-```
-决策维度：  供应商 / 模型 / thinking level / 参数 profile（temperature、maxTokens…）
-策略输入：  任务类型 · 能力要求（reasoning/vision/长上下文） · 成本上限
-            · 失败信号 · 上下文规模 · 用户偏好排序
-升级语义：  推理型失败 → 更强模型；重复失败 → 换模型而非仅升档
-降级语义：  任务明显变简单（阶段切换，如 debug 修复 → 文档补全）→ 更便宜的模型。
-            “长期稳定”不是降级的理由，只是确认简单阶段不是一时波动的
-            防抖条件（连续干净轮次 + 稳定窗口/地板/上限，复用本仓库设计）
-```
-
-与本仓库的关系：
-
-- **协作而非合并**：pi-model-router-jev 把 thinking level 收编为自有维度后，thinking-router-jev 可作为它的档位决策输入之一被调用；两者绝不同时抢 `setThinkingLevel`（切换模型后 pi 会按新模型的 `thinkingLevelMap` 重钳档位，档位决策必须感知当前模型，这正是它们必须统一拥有的原因，见 §7）；
-- **代码复用**：AgentState 收集器、错误分类器、触发时机设计、钳制思想、JSONL 审计模式可直接抽取共享或复制——这些模块都很小，复制的成本远低于耦合；
-- **如实说明现状**：本仓库当前实现用“连续干净轮次”作为降级触发，是“任务变简单”的保守代理指标——因为 pi 目前无法直接观测任务阶段切换（这本身是新项目要补的能力：把 task_type 阶段迁移作为一等降级信号，稳定性窗口退居防抖条件）。
-- **开源定位**：pi-thinking-router-jev 绑定 jev 接入；pi-model-router-jev 做成模型无关的通用策略引擎，任何 provider/model 组合都能用。
-
-### 8.3 愿景
-
-```
-用户任务
-   ↓
-┌─────────────────────────────┐
-│  pi-model-router-jev        │   任务类型 / 能力要求 / 成本上限 / 失败信号
-│  （策略引擎：模型·参数·档位） │
-└──────────┬──────────────────┘
-           │ 模型 A + thinking=low        ← 简单改动：便宜快
-           │ 模型 B + thinking=high       ← 复杂 debug：升级
-           ↓
-     pi coding agent ──执行反馈──→ 重新决策
-```
-
-最终形态：代理的每一个维度（谁来推理、想多深、什么参数）都由任务状态与执行反馈动态决定——在成功率不打折的前提下，把钱花在真正需要的地方。
-
-## 9 仓库结构
-
-```
-pi-thinking-router-jev/
-├── index.ts            # pi 扩展入口：事件接线 + /thinking-router 命令
-├── src/
-│   ├── engine.ts       # 决策编排（可测试核心）
-│   ├── policy.ts       # 本地规则引擎 + 防抖钳制
-│   ├── jev-client.ts   # jev choice 协议客户端 + key 解析
-│   ├── state.ts        # AgentState 收集 + 任务类型分类
-│   ├── errors.ts       # 环境型 vs 推理型错误分类
-│   ├── config.ts       # 配置加载/保存/校验
-│   ├── logger.ts       # JSONL 决策日志
-│   └── levels.ts       # 档位类型与折叠规则
-├── test/               # unit / integration(mock jev) / live-jev
-│   └── README.md       # 测试设计文档（各层覆盖、对抗样本、回归用例）
-├── scripts/
-│   ├── jev-ping.ts     # 连通性双探针
-│   ├── benchmark.ts    # 3-seed A/B 基准（max vs thinking-router）
-│   └── charts.py       # 本 README 全部图表（可复现）
-└── assets/             # 生成的 PNG
-```
-
----
-
-*实验环境：pi 0.86.1 · glm-5.3-flash · jev-1.13.0 · Node 24 · Windows。数据来自本仓库测试与 `~/.pi/thinking-router/decisions.jsonl` 真实运行记录；图表由 `python scripts/charts.py` 从转写数据生成。*
+实验环境：pi 0.86.1、Node 24、Windows；详细数据和边界说明见[验证文档](docs/validation.md)。
